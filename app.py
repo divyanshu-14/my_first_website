@@ -7,10 +7,10 @@ from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-app = FastAPI(title="Distributed Object Storage Cluster")
+app = FastAPI(title="VAULT Distributed Object Storage")
 
 # =====================================================================
-# CORE ENGINE: CHECKSUM & CONSISTENT HASH RING
+# CORE ENGINE: CHECKSUM & STORAGE ENVELOPE
 # =====================================================================
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -46,10 +46,10 @@ class StorageNode:
         if not self.is_alive:
             return None
         if key in self.corrupted_keys:
-            raise IOError("Bit-rot silent corruption detected")
+            raise IOError("Bit-rot detected")
         env = self.store.get(key)
         if env and sha256(env.payload) != env.checksum:
-            raise IOError("SHA-256 Checksum validation mismatch")
+            raise IOError("Checksum verification failure")
         return env
 
 class ConsistentHashRing:
@@ -87,26 +87,25 @@ class ConsistentHashRing:
         return pref
 
 # =====================================================================
-# COORDINATOR: SLOPPY QUORUM & READ REPAIR
+# COORDINATOR: QUORUM & RECOVERY
 # =====================================================================
 class StorageCoordinator:
     def __init__(self, ring: ConsistentHashRing, N: int = 3, W: int = 2, R: int = 2):
         self.ring = ring
         self.N, self.W, self.R = N, W, R
         self.hints: Dict[str, List[StorageEnvelope]] = {}
-        self.logs: List[dict] = []
+        self.events: List[dict] = []
         self.total_writes = 0
         self.total_reads = 0
-        self.total_repairs = 0
 
-    def log(self, text: str, tag: str = "INFO"):
-        self.logs.insert(0, {
-            "time": time.strftime("%H:%M:%S"),
-            "text": text,
-            "tag": tag
+    def record_event(self, title: str, category: str = "Replication"):
+        self.events.insert(0, {
+            "title": title,
+            "category": category,
+            "time": time.strftime("%d %b %Y, %H:%M:%S")
         })
-        if len(self.logs) > 30:
-            self.logs.pop()
+        if len(self.events) > 30:
+            self.events.pop()
 
     def write(self, key: str, data: bytes) -> dict:
         self.total_writes += 1
@@ -121,21 +120,21 @@ class StorageCoordinator:
                 successes += 1
             else:
                 self.hints.setdefault(nid, []).append(env)
-                self.log(f"Node {nid} DOWN. Buffered hinted handoff for '{key}'", "WARN")
+                self.record_event(f"Node {nid} unavailable. Buffered hinted handoff for '{key}'", "Fallback")
                 successes += 1
 
         if successes < self.W:
-            self.log(f"Quorum Write failed for '{key}' ({successes}/{self.W})", "CRIT")
+            self.record_event(f"Write quorum failed for '{key}' ({successes}/{self.W})", "Error")
             raise HTTPException(status_code=500, detail="Write Quorum Failed")
 
-        self.log(f"WRITE COMMITTED: '{key}' → Replicas: {pref} (Ack {successes}/{self.W})", "WRITE")
+        self.record_event(f"Object '{key}' replicated to {', '.join(pref)} ({len(data)} B)", "Replication")
         return {"key": key, "replicas": pref, "quorum": f"{successes}/{self.W}"}
 
     def read(self, key: str) -> dict:
         self.total_reads += 1
         pref = self.ring.get_preference_list(key)
         responses = []
-        corrupted = []
+        to_repair = []
 
         for nid in pref:
             node = self.ring.nodes[nid]
@@ -144,30 +143,29 @@ class StorageCoordinator:
                 if env:
                     responses.append((nid, env))
             except IOError:
-                corrupted.append(nid)
-                self.log(f"Bit-rot detected on {nid} for '{key}'", "CRIT")
+                to_repair.append(nid)
+                self.record_event(f"Bit-rot silent corruption caught on {nid} for '{key}'", "Integrity")
 
         if len(responses) < self.R:
-            self.log(f"Quorum Read failed for '{key}' ({len(responses)}/{self.R})", "CRIT")
+            self.record_event(f"Read quorum failed for '{key}' ({len(responses)}/{self.R})", "Error")
             raise HTTPException(status_code=404, detail="Quorum Read Failed")
 
         best_nid, best_env = responses[0]
-        repaired = []
-        for nid in corrupted:
+        repaired_nodes = []
+        for nid in to_repair:
             self.ring.nodes[nid].corrupted_keys.discard(key)
             self.ring.nodes[nid].write(best_env)
-            repaired.append(nid)
-            self.total_repairs += 1
-            self.log(f"READ-REPAIR: Restored valid replica on {nid} for '{key}'", "HEAL")
+            repaired_nodes.append(nid)
+            self.record_event(f"Read-Repair healed corrupted replica on {nid} for '{key}'", "Self-Healing")
 
-        self.log(f"READ SUCCESS: '{key}' served from {best_nid}", "READ")
+        self.record_event(f"Integrity check: 1 verified, {len(repaired_nodes)} repaired for '{key}'", "Integrity")
         return {
             "key": key,
             "payload": best_env.payload.decode(errors="replace"),
             "checksum": best_env.checksum,
             "served_by": best_nid,
             "preference_list": pref,
-            "repaired_nodes": repaired
+            "repaired_replicas": repaired_nodes
         }
 
     def flush_hints(self, nid: str):
@@ -175,160 +173,269 @@ class StorageCoordinator:
             items = self.hints.pop(nid)
             for env in items:
                 self.ring.nodes[nid].write(env)
-            self.log(f"HINT DRAIN: Synchronized {len(items)} missed writes to {nid}", "HEAL")
+            self.record_event(f"Flushed {len(items)} buffered hints to revived {nid}", "Recovery")
 
-# 5 Balanced Cluster Nodes
+# Setup 5 Named Nodes
 ring = ConsistentHashRing(replica_count=3, vnodes=16)
-for i in range(1, 6):
-    ring.add_node(StorageNode(f"Node-{i}", capacity_gb=10))
+node_names = ["node-alpha", "node-beta", "node-delta", "node-epsilon", "node-gamma"]
+caps = [10, 10, 8, 8, 10]
+for name, cap in zip(node_names, caps):
+    ring.add_node(StorageNode(name, capacity_gb=cap))
 coordinator = StorageCoordinator(ring, N=3, W=2, R=2)
 
 # =====================================================================
-# CLEAN & SPACIOUS HACKATHON DASHBOARD
+# UI WITH COLLAPSIBLE SIDEBAR
 # =====================================================================
 @app.get("/", response_class=HTMLResponse)
 def index():
-    alive = sum(1 for n in ring.nodes.values() if n.is_alive)
+    alive_nodes = sum(1 for n in ring.nodes.values() if n.is_alive)
     total_nodes = len(ring.nodes)
-    total_keys = len({k for n in ring.nodes.values() for k in n.store.keys()})
-    quorum_safe = "OPTIMAL" if alive >= 3 else ("DEGRADED" if alive == 2 else "CRITICAL")
-    q_color = "#22c55e" if alive >= 3 else ("#eab308" if alive == 2 else "#ef4444")
+    unique_keys = {k for n in ring.nodes.values() for k in n.store.keys()}
+    total_objects = len(unique_keys)
+    total_replicas = sum(len(n.store) for n in ring.nodes.values())
+    
+    any_corrupt = any(len(n.corrupted_keys) > 0 for n in ring.nodes.values())
+    integrity_status = "Corrupted" if any_corrupt else "Clean"
+    integrity_color = "#f85149" if any_corrupt else "#38d39f"
+    integrity_sub = "Bit-rot active" if any_corrupt else "No corruption"
 
-    # Node Cards
-    node_cards = ""
+    # Node Rows
+    node_rows = ""
     for nid, node in ring.nodes.items():
         is_up = node.is_alive
-        c_status = "#22c55e" if is_up else "#ef4444"
-        txt_status = "ONLINE" if is_up else "OFFLINE"
-        keys = list(node.store.keys())
-        keys_html = "".join(f"<span class='badge'>{k}</span>" for k in keys) if keys else "<span style='color:#64748b;font-size:12px;'>No keys</span>"
-        rot_alert = "<span style='color:#ef4444;font-size:10px;font-weight:700;'>[☣️ BIT-ROT]</span>" if node.corrupted_keys else ""
+        status_badge = '<span class="status-badge status-healthy">● HEALTHY</span>' if is_up else '<span class="status-badge status-offline">● OFFLINE</span>'
+        has_rot = len(node.corrupted_keys) > 0
+        rot_badge = '<span style="color:#f85149;font-size:11px;font-weight:bold;margin-left:6px;">[☣️ CORRUPTED]</span>' if has_rot else ''
+        
+        used_kb = round(node.used_bytes / 1024, 2)
+        total_gb = int(node.capacity_bytes / (1024**3))
+        pct = round((node.used_bytes / node.capacity_bytes) * 100, 3)
+        progress_width = max(pct, 2) if node.used_bytes > 0 else 0
 
-        node_cards += f"""
-        <div class="card {'card-down' if not is_up else ''}">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                <b style="font-size:15px;color:#fff;">{nid}</b>
-                <span style="color:{c_status};font-size:11px;font-weight:700;">● {txt_status} {rot_alert}</span>
+        node_rows += f"""
+        <div class="node-row {'node-row-down' if not is_up else ''}">
+            <div class="node-info-top">
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span style="font-weight:600;font-size:14px;color:#f0f6fc;">{nid}</span>
+                    {status_badge}
+                    {rot_badge}
+                </div>
+                <div style="font-size:12px;color:#8b949e;font-weight:500;">
+                    {used_kb} KB / {total_gb} GB &nbsp;&bull;&nbsp; <span style="color:#58a6ff;">{pct}%</span>
+                </div>
             </div>
-            <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">Replicas: <b style="color:#38bdf8;">{len(keys)}</b></div>
-            <div style="min-height:26px;display:flex;flex-wrap:wrap;gap:4px;margin-bottom:12px;">{keys_html}</div>
-            <div style="display:flex;gap:6px;">
-                <button onclick="toggleNode('{nid}')" class="btn-xs btn-crash">{ 'Crash' if is_up else 'Revive' }</button>
-                <button onclick="corruptNode('{nid}')" class="btn-xs btn-rot" {'disabled' if not keys or not is_up else ''}>Bit-Rot</button>
+            <div style="font-size:11px;color:#8b949e;margin: 4px 0 8px 0;">
+                {len(node.store)} replicas stored
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" style="width: {progress_width}%;"></div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:10px;">
+                <button onclick="toggleNode('{nid}')" class="btn-ctrl btn-warn">{ 'Crash Node' if is_up else 'Revive Node' }</button>
+                <button onclick="corruptNode('{nid}')" class="btn-ctrl btn-danger" {'disabled' if not node.store or not is_up else ''}>Inject Bit-Rot</button>
             </div>
         </div>
         """
 
-    # Logs
-    log_rows = ""
-    for l in coordinator.logs:
-        c = "#38bdf8"
-        if l["tag"] in ["WRITE", "READ"]: c = "#22c55e"
-        elif l["tag"] == "HEAL": c = "#a855f7"
-        elif l["tag"] == "WARN": c = "#eab308"
-        elif l["tag"] == "CRIT": c = "#ef4444"
-        log_rows += f"""<div style="margin-bottom:5px;"><span style="color:#64748b;">[{l['time']}]</span> <b style="color:{c};">[{l['tag']}]</b> <span style="color:#e2e8f0;">{l['text']}</span></div>"""
+    # Events HTML
+    events_html = ""
+    for ev in coordinator.events:
+        events_html += f"""
+        <div class="event-item">
+            <div style="display:flex;align-items:center;gap:6px;">
+                <span class="event-dot"></span>
+                <span style="font-size:12.5px;color:#e6edf3;font-weight:500;">{ev['title']}</span>
+            </div>
+            <div style="font-size:11px;color:#8b949e;margin-top:3px;padding-left:14px;">{ev['time']}</div>
+        </div>
+        """
+    if not events_html:
+        events_html = "<div style='color:#6e7681;font-size:12px;padding:10px;'>No events recorded. System optimal.</div>"
 
     return f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Fault-Tolerant Distributed Storage Cluster</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Vault - Distributed Object Storage</title>
         <style>
             * {{ box-sizing: border-box; margin:0; padding:0; }}
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #f8fafc; padding: 24px; }}
-            .container {{ max-width: 1200px; margin: 0 auto; }}
-            .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 20px; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #c9d1d9; display: flex; min-height: 100vh; overflow-x: hidden; }}
             
-            /* Top Stats Bar */
-            .stats-bar {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }}
-            .stat-box {{ background: #111827; border: 1px solid #1e293b; border-radius: 8px; padding: 14px 18px; }}
-            .stat-title {{ font-size: 11px; text-transform: uppercase; color: #94a3b8; font-weight: 700; }}
-            .stat-val {{ font-size: 22px; font-weight: 800; color: #fff; margin-top: 4px; }}
+            /* Sidebar with smooth collapse transition */
+            .sidebar {{ width: 250px; background: #0e1526; border-right: 1px solid #1c263d; display: flex; flex-direction: column; padding: 20px 16px; flex-shrink: 0; transition: transform 0.3s ease, margin-left 0.3s ease; }}
+            .sidebar.collapsed {{ margin-left: -250px; }}
             
-            /* Node Row */
-            .nodes-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }}
-            .card {{ background: #111827; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; }}
-            .card-down {{ border-color: #ef444455; background: #1f1315; }}
-            .badge {{ background: #1e293b; color: #38bdf8; font-family: monospace; font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid #38bdf833; }}
-            .btn-xs {{ flex: 1; padding: 6px; font-size: 11px; font-weight: 700; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }}
-            .btn-crash {{ background: #261f18; color: #eab308; border-color: #713f12; }}
-            .btn-rot {{ background: #2b171c; color: #ef4444; border-color: #7f1d1d; }}
-            .btn-xs:disabled {{ opacity: 0.3; cursor: not-allowed; }}
+            .brand {{ display: flex; align-items: center; gap: 10px; margin-bottom: 26px; padding: 0 4px; }}
+            .brand-logo {{ width: 34px; height: 34px; background: linear-gradient(135deg, #38ef7d, #11998e); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 900; color: #fff; font-size: 18px; }}
+            .brand-text h2 {{ font-size: 16px; font-weight: 700; color: #fff; }}
+            .brand-text span {{ font-size: 10px; color: #58a6ff; font-weight: 600; text-transform: uppercase; }}
             
-            /* Bottom 2 Columns */
-            .main-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
-            input {{ width: 100%; background: #070a12; border: 1px solid #1e293b; border-radius: 6px; padding: 10px 12px; color: #fff; margin-bottom: 10px; font-size: 13px; }}
-            input:focus {{ outline:none; border-color:#38bdf8; }}
-            button.primary {{ padding: 10px 16px; border-radius: 6px; font-weight: 700; cursor: pointer; border: none; color: #fff; font-size: 13px; }}
-            button.green {{ background: #22c55e; }}
-            button.blue {{ background: #0ea5e9; }}
+            .nav-group {{ display: flex; flex-direction: column; gap: 4px; flex-grow: 1; }}
+            .nav-item {{ display: flex; align-items: center; gap: 12px; padding: 10px 12px; color: #8b949e; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 500; }}
+            .nav-item:hover, .nav-item.active {{ background: #1a233a; color: #58a6ff; }}
             
-            .terminal {{ background: #070a12; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; font-family: monospace; font-size: 11.5px; height: 260px; overflow-y: auto; }}
-            #readResult {{ display:none; background: #070a12; border: 1px solid #0ea5e9; border-radius: 6px; padding: 12px; margin-top: 12px; }}
+            /* Main Content Area */
+            .main {{ flex-grow: 1; padding: 24px 32px; width: 100%; transition: all 0.3s ease; }}
+            .top-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
+            
+            /* Hamburger Toggle Button */
+            .toggle-btn {{ background: #162035; border: 1px solid #1f293d; color: #fff; font-size: 16px; border-radius: 8px; width: 38px; height: 38px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.2s; }}
+            .toggle-btn:hover {{ background: #1f293d; }}
+
+            /* 4 Metric Cards */
+            .metrics-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }}
+            .metric-card {{ background: #111827; border: 1px solid #1f293d; border-radius: 10px; padding: 18px 20px; }}
+            .metric-title {{ font-size: 11px; font-weight: 700; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }}
+            .metric-val {{ font-size: 26px; font-weight: 700; color: #fff; margin: 8px 0 4px 0; }}
+            .metric-sub {{ font-size: 12px; color: #8b949e; }}
+            
+            /* Content Layout */
+            .content-grid {{ display: grid; grid-template-columns: 1.6fr 1fr; gap: 20px; }}
+            .panel {{ background: #111827; border: 1px solid #1f293d; border-radius: 10px; padding: 20px; }}
+            .panel-header {{ font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }}
+            
+            .node-row {{ background: #0d1322; border: 1px solid #1c263d; border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }}
+            .node-row-down {{ border-color: #7f1d1d; background: #1c1117; }}
+            .node-info-top {{ display: flex; justify-content: space-between; align-items: center; }}
+            .status-badge {{ font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 12px; }}
+            .status-healthy {{ background: rgba(56, 211, 159, 0.12); color: #38d39f; border: 1px solid rgba(56, 211, 159, 0.3); }}
+            .status-offline {{ background: rgba(248, 81, 73, 0.12); color: #f85149; border: 1px solid rgba(248, 81, 73, 0.3); }}
+            
+            .progress-bar {{ height: 6px; background: #1f293d; border-radius: 3px; overflow: hidden; }}
+            .progress-fill {{ height: 100%; background: linear-gradient(90deg, #1f6feb, #38ef7d); border-radius: 3px; }}
+            
+            .btn-ctrl {{ padding: 6px 12px; border-radius: 6px; font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid transparent; }}
+            .btn-warn {{ background: #261f18; color: #e3b341; border-color: #59441f; }}
+            .btn-danger {{ background: #2b171c; color: #f85149; border-color: #7f1d1d; }}
+            .btn-ctrl:disabled {{ opacity: 0.3; cursor: not-allowed; }}
+            
+            .op-box {{ margin-top: 20px; background: #0d1322; border: 1px solid #1c263d; border-radius: 8px; padding: 16px; }}
+            input {{ width: 100%; background: #070a12; border: 1px solid #1c263d; border-radius: 6px; padding: 9px 12px; color: #fff; margin-bottom: 8px; font-size: 13px; }}
+            button.primary {{ background: #1f6feb; border: none; color: #fff; font-weight: 600; padding: 9px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }}
+            button.success {{ background: #238636; }}
+            
+            .event-item {{ border-bottom: 1px solid #1c263d; padding: 10px 0; }}
+            .event-item:last-child {{ border-bottom: none; }}
+            .event-dot {{ width: 6px; height: 6px; border-radius: 50%; background: #38ef7d; display: inline-block; }}
+            
+            #readOutput {{ display: none; background: #070a12; border: 1px solid #1f6feb; border-radius: 6px; padding: 12px; margin-top: 10px; }}
         </style>
     </head>
     <body>
-        <div class="container">
-            <div class="header">
-                <div>
-                    <h2 style="font-size:22px;color:#fff;">Fault-Tolerant Distributed Storage Cluster</h2>
-                    <p style="color:#94a3b8;font-size:12px;margin-top:4px;">Sloppy Quorum (N=3, W=2, R=2) • Consistent Hashing • Self-Healing Merkle Bit-Rot Repair</p>
+        <!-- Left Collapsible Sidebar -->
+        <div class="sidebar" id="sidebar">
+            <div class="brand">
+                <div class="brand-logo">V</div>
+                <div class="brand-text">
+                    <h2>VAULT</h2>
+                    <span>Distributed Storage</span>
                 </div>
-                <div style="text-align:right;">
-                    <div style="font-size:11px;color:#94a3b8;font-weight:700;">QUORUM STATE</div>
-                    <div style="font-size:16px;font-weight:800;color:{q_color};">● {quorum_safe}</div>
+            </div>
+            <div class="nav-group">
+                <a href="/" class="nav-item active">⊞ Dashboard</a>
+                <a href="#ops" class="nav-item">⬆ Store & Read</a>
+                <a href="#nodes" class="nav-item">🖧 Storage Nodes</a>
+                <a href="#events" class="nav-item">⚡ Event Logs</a>
+            </div>
+            <div style="font-size: 11px; color: #58a6ff; padding: 8px 12px; background: #161f33; border-radius: 6px;">
+                ● Connected • Quorum Active
+            </div>
+        </div>
+
+        <!-- Main Dashboard View -->
+        <div class="main">
+            <div class="top-header">
+                <div style="display:flex;align-items:center;gap:14px;">
+                    <!-- Manual Open / Close Button -->
+                    <button class="toggle-btn" onclick="toggleSidebar()" title="Toggle Sidebar">☰</button>
+                    <div>
+                        <h1 style="font-size:22px;color:#fff;">System Dashboard</h1>
+                        <p style="font-size:13px;color:#8b949e;">Real-time distributed consensus, replication & self-healing analytics</p>
+                    </div>
+                </div>
+                <button onclick="window.location.reload()" class="btn-ctrl" style="background:#1a233a;color:#58a6ff;border:1px solid #1f6feb;padding:8px 14px;">↻ Refresh</button>
+            </div>
+
+            <!-- Top Metric Cards -->
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-title">Total Objects</div>
+                    <div class="metric-val">{total_objects}</div>
+                    <div class="metric-sub">{total_objects} active keys</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">Storage Nodes</div>
+                    <div class="metric-val">{alive_nodes}/{total_nodes}</div>
+                    <div class="metric-sub">{alive_nodes} nodes healthy</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">Total Replicas</div>
+                    <div class="metric-val">{total_replicas}</div>
+                    <div class="metric-sub">{coordinator.total_writes} writes committed</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">Data Integrity</div>
+                    <div class="metric-val" style="color: {integrity_color};">{integrity_status}</div>
+                    <div class="metric-sub">{integrity_sub}</div>
                 </div>
             </div>
 
-            <!-- Stats -->
-            <div class="stats-bar">
-                <div class="stat-box"><div class="stat-title">Active Nodes</div><div class="stat-val">{alive} / {total_nodes}</div></div>
-                <div class="stat-box"><div class="stat-title">Cluster Objects</div><div class="stat-val">{total_keys}</div></div>
-                <div class="stat-box"><div class="stat-title">Total Writes</div><div class="stat-val">{coordinator.total_writes}</div></div>
-                <div class="stat-box"><div class="stat-title">Auto Repairs</div><div class="stat-val" style="color:#a855f7;">{coordinator.total_repairs}</div></div>
-            </div>
+            <!-- Central Grid -->
+            <div class="content-grid">
+                <div class="panel" id="nodes">
+                    <div class="panel-header">
+                        <span>Storage Nodes (Consistent Hashing Ring)</span>
+                        <span style="font-size:11px;color:#8b949e;">Sloppy Quorum: N=3, W=2, R=2</span>
+                    </div>
+                    {node_rows}
 
-            <!-- Nodes Cards Grid -->
-            <div class="nodes-grid">{node_cards}</div>
+                    <!-- Operations -->
+                    <div class="op-box" id="ops">
+                        <div style="font-weight:600;font-size:14px;color:#fff;margin-bottom:10px;">Store / Retrieve Objects</div>
+                        <form onsubmit="handleWrite(event)" style="margin-bottom:14px;">
+                            <div style="display:flex;gap:8px;">
+                                <input type="text" id="wKey" placeholder="Object Key (e.g., config.json)" required style="flex:1;">
+                                <input type="text" id="wVal" placeholder="Payload content" required style="flex:1;">
+                                <button type="submit" class="primary success" style="height:37px;">Store Object</button>
+                            </div>
+                        </form>
+                        
+                        <form onsubmit="handleRead(event)">
+                            <div style="display:flex;gap:8px;">
+                                <input type="text" id="rKey" placeholder="Object key to fetch" required style="flex:1;margin-bottom:0;">
+                                <button type="submit" class="primary" style="height:37px;">Fetch with Quorum</button>
+                            </div>
+                        </form>
 
-            <!-- Operations & Logs -->
-            <div class="main-grid">
-                <div class="card">
-                    <h3 style="font-size:15px;color:#fff;margin-bottom:12px;">Store Object (W=2, N=3)</h3>
-                    <form onsubmit="handleWrite(event)">
-                        <input type="text" id="wKey" placeholder="Key (e.g., file.txt, user_data)" required>
-                        <input type="text" id="wVal" placeholder="Payload content" required>
-                        <button type="submit" class="primary green">Commit to Quorum</button>
-                    </form>
-
-                    <h3 style="font-size:15px;color:#fff;margin:20px 0 10px 0;">Retrieve Object (R=2)</h3>
-                    <form onsubmit="handleRead(event)">
-                        <div style="display:flex;gap:8px;">
-                            <input type="text" id="rKey" placeholder="Enter key to read" required style="margin-bottom:0;">
-                            <button type="submit" class="primary blue" style="white-space:nowrap;">Consensus Read</button>
+                        <div id="readOutput">
+                            <div style="font-size:11px;color:#58a6ff;font-weight:bold;">PAYLOAD FETCHED & VERIFIED</div>
+                            <div id="outPayload" style="font-size:14px;color:#fff;font-weight:600;margin:4px 0;"></div>
+                            <div style="font-size:11px;color:#8b949e;">SHA-256: <span id="outHash" style="color:#38ef7d;font-family:monospace;"></span></div>
+                            <div id="outHealing" style="font-size:11px;color:#e3b341;margin-top:4px;"></div>
                         </div>
-                    </form>
-
-                    <div id="readResult">
-                        <div style="font-size:11px;color:#38bdf8;font-weight:700;">PAYLOAD FETCHED & VERIFIED</div>
-                        <div id="resPayload" style="font-size:14px;color:#fff;font-weight:700;margin:4px 0;"></div>
-                        <div style="font-size:11px;color:#94a3b8;">SHA-256: <span id="resHash" style="color:#22c55e;font-family:monospace;"></span></div>
-                        <div style="font-size:11px;color:#94a3b8;">Replicas: <span id="resReplicas" style="color:#fff;"></span></div>
-                        <div id="resRepair" style="font-size:11px;color:#a855f7;margin-top:4px;font-weight:700;"></div>
                     </div>
                 </div>
 
-                <div class="card">
-                    <h3 style="font-size:15px;color:#fff;margin-bottom:12px;">Live Operational Logs</h3>
-                    <div class="terminal">{log_rows or "<div style='color:#64748b;'>Cluster ready. No events yet.</div>"}</div>
+                <div class="panel" id="events">
+                    <div class="panel-header">
+                        <span>Recent Events & Audit</span>
+                        <span style="font-size:11px;color:#38d39f;">● Live Sync</span>
+                    </div>
+                    <div style="max-height: 520px; overflow-y: auto;">
+                        {events_html}
+                    </div>
                 </div>
             </div>
         </div>
 
         <script>
+            function toggleSidebar() {{
+                const sb = document.getElementById('sidebar');
+                sb.classList.toggle('collapsed');
+            }}
+
             async function handleWrite(e) {{
                 e.preventDefault();
                 const key = document.getElementById('wKey').value;
@@ -345,18 +452,17 @@ def index():
                 const key = document.getElementById('rKey').value;
                 const res = await fetch('/api/read?key=' + encodeURIComponent(key));
                 if (!res.ok) {{
-                    alert('Quorum Read Failed: Key not found or replicas unreachable!');
+                    alert('Read Quorum Failed: Key not found or insufficient replicas!');
                     return;
                 }}
                 const data = await res.json();
-                document.getElementById('readResult').style.display = 'block';
-                document.getElementById('resPayload').innerText = '"' + data.payload + '"';
-                document.getElementById('resHash').innerText = data.checksum.substring(0, 24) + '...';
-                document.getElementById('resReplicas').innerText = data.preference_list.join(', ');
-                if (data.repaired_nodes.length > 0) {{
-                    document.getElementById('resRepair').innerText = '⚡ Read-Repair Healed: ' + data.repaired_nodes.join(', ');
+                document.getElementById('readOutput').style.display = 'block';
+                document.getElementById('outPayload').innerText = '"' + data.payload + '"';
+                document.getElementById('outHash').innerText = data.checksum;
+                if (data.repaired_replicas.length > 0) {{
+                    document.getElementById('outHealing').innerText = '⚡ Read-Repair auto-healed node: ' + data.repaired_replicas.join(', ');
                 }} else {{
-                    document.getElementById('resRepair').innerText = '✅ Quorum Consensus Verified';
+                    document.getElementById('outHealing').innerText = '✅ Quorum Consensus Verified';
                 }}
             }}
 
@@ -390,7 +496,7 @@ def api_toggle(nid: str):
     if nid in ring.nodes:
         ring.nodes[nid].is_alive = not ring.nodes[nid].is_alive
         status = "revived" if ring.nodes[nid].is_alive else "crashed"
-        coordinator.log(f"{nid} was {status}", "WARN" if status == "crashed" else "HEAL")
+        coordinator.record_event(f"Simulation: {nid} was {status}", "FaultInjection")
         if ring.nodes[nid].is_alive:
             coordinator.flush_hints(nid)
     return {"status": "ok"}
@@ -400,10 +506,9 @@ def api_corrupt(nid: str):
     if nid in ring.nodes and ring.nodes[nid].store:
         target = list(ring.nodes[nid].store.keys())[0]
         ring.nodes[nid].corrupted_keys.add(target)
-        coordinator.log(f"Bit-rot injected into {nid} for '{target}'", "CRIT")
+        coordinator.record_event(f"Bit-rot injected into {nid} for '{target}'", "FaultInjection")
     return {"status": "ok"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
